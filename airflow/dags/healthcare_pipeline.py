@@ -1,37 +1,43 @@
 """
-healthcare_pipeline DAG  (trigger-only, no sensor)
-Transforms validated Bronze data into Silver + Gold.
-  dbt run -> dbt snapshot -> dbt test -> reconciliation.
+============================================================================
+ HEALTHCARE PIPELINE DAG  —  the Airflow schedule that RUNS dbt
+============================================================================
+WHAT THIS FILE DOES (in plain English):
+  After the gatekeeper loads clean data into RAW (Bronze), this DAG runs dbt
+  to transform it into the Silver and Gold layers. Its four tasks run in order:
 
-The GATEKEEPER (gatekeeper_dag.py) is the single validated ingestion path: it
-validates every file, loads good ones into RAW, quarantines bad ones, then
-TRIGGERS this pipeline. This DAG runs when the gatekeeper triggers it (and on a
-10-min backup schedule).
+     dbt_run        -> build the Silver (STAGING) and Gold (MARTS) tables
+     dbt_snapshot   -> capture the SCD2 doctor history
+     dbt_test       -> run the data-quality tests
+     reconciliation -> a final "pipeline complete" marker
 
-ALERTS (email only on REAL breakage):
-  - dbt run breaks         -> dbt_run task fails  -> email names the FAILING MODEL
-  - any dbt test fails      -> dbt_test task fails -> email
-  - any task error          -> on_failure_callback -> email + PIPELINE_ERROR_LOG
+  This DAG is normally TRIGGERED by the gatekeeper DAG right after a load,
+  and also runs on its own 10-minute schedule as a backup.
 
-ROOT-CAUSE CAPTURE:
-  Each dbt task writes its output to a log file under /tmp. When a task fails,
-  the callback reads that file, finds the actual dbt ERROR line (e.g. the failing
-  model name like STAGING.stg_admissions), and puts it in BOTH the email and the
-  PIPELINE_ERROR_LOG row -- so you see the real cause, not a generic message.
+ROOT-CAUSE ALERTING:
+  Each dbt task writes its output to a log file. If a task fails, the failure
+  handler reads that log, finds the ACTUAL failing model (e.g.
+  STAGING.stg_admissions), and puts that real cause into both the alert email
+  and the PIPELINE_ERROR_LOG row - so you see exactly what broke, not a
+  generic message.
+============================================================================
 """
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
+# Paths inside the Airflow container (mapped from your project by docker-compose)
 PROJECT = "/opt/airflow/project"
-PROFILES_DIR = "/opt/airflow/config"
+PROFILES_DIR = "/opt/airflow/config"     # where dbt finds profiles.yml
 ALERT_EMAIL = "priyankapandey000111@gmail.com"
 
-# Each task tees its output here so the failure callback can read the real error.
+# Each dbt task writes its console output here so the failure handler can read it.
 LOG_DIR = "/tmp/dbt_task_logs"
 
 
 def _snowflake_session():
+    """Open a Snowflake connection (key-pair auth) for the failure handler to
+       send the alert email and write to the error-log table."""
     import os
     from snowflake.snowpark import Session
     from cryptography.hazmat.primitives import serialization
@@ -49,12 +55,13 @@ def _snowflake_session():
 
 
 def extract_dbt_error(task_id):
-    """Read the task's dbt output log and pull out the real error line(s).
-       Returns a short, specific string like:
-         'Model failed to build: STAGING.stg_admissions'
-       Falls back to a generic message if no log / no ERROR line is found."""
+    """Read the failed task's dbt log and pull out the REAL error line, e.g.
+       'Model failed to build: STAGING.stg_admissions'. Looks for four common
+       dbt error patterns. If none match (or there's no log), returns a
+       sensible generic message instead."""
     import os, re
     log_path = os.path.join(LOG_DIR, f"{task_id}.log")
+    # Fallback messages if we can't find a specific cause in the log.
     generic = {
         "dbt_run":        "dbt failed to build the Silver/Gold models (broken SQL or model error).",
         "dbt_snapshot":   "dbt failed to capture SCD2 snapshot history.",
@@ -71,31 +78,31 @@ def extract_dbt_error(task_id):
     except Exception:
         return generic
 
-    # Strip ANSI colour codes dbt writes to the console (e.g. \x1b[31m)
+    # Remove the colour codes dbt prints to the console (e.g. the red \x1b[31m).
     clean = re.sub(r"\x1b\[[0-9;]*m", "", text)
     lines = clean.splitlines()
 
     hits = []
 
-    # 1) Model build failures:  "ERROR creating sql ... model STAGING.stg_admissions"
+    # Pattern 1 - a model failed to build: "ERROR creating ... model STAGING.stg_admissions"
     for ln in lines:
         m = re.search(r"ERROR creating.*model\s+([A-Za-z0-9_.]+)", ln)
         if m:
             hits.append("Model failed to build: " + m.group(1))
 
-    # 2) Compilation errors:  "Compilation Error in model stg_admissions (path)"
+    # Pattern 2 - a compilation error in a model/test/snapshot
     for ln in lines:
         m = re.search(r"Compilation Error in (model|test|snapshot)\s+([A-Za-z0-9_.]+)", ln)
         if m:
             hits.append("Compilation error in " + m.group(1) + ": " + m.group(2))
 
-    # 3) Database errors:  "Database Error in model stg_admissions"
+    # Pattern 3 - a database error in a model/test/snapshot
     for ln in lines:
         m = re.search(r"Database Error in (model|test|snapshot)\s+([A-Za-z0-9_.]+)", ln)
         if m:
             hits.append("Database error in " + m.group(1) + ": " + m.group(2))
 
-    # 4) Failing tests:  "Failure in test not_null_fct_claims_insurance_sk"
+    # Pattern 4 - a failing data-quality test
     for ln in lines:
         m = re.search(r"Failure in test\s+([A-Za-z0-9_.]+)", ln)
         if m:
@@ -104,7 +111,7 @@ def extract_dbt_error(task_id):
     if not hits:
         return generic
 
-    # De-duplicate while preserving order, cap length so the email stays tidy.
+    # Remove duplicates (keep order) and keep the message tidy.
     seen, unique = set(), []
     for h in hits:
         if h not in seen:
@@ -114,6 +121,9 @@ def extract_dbt_error(task_id):
 
 
 def send_failure_email(context):
+    """Runs automatically when any task in this DAG fails. It finds the real
+       cause, emails an alert, and writes a matching row to PIPELINE_ERROR_LOG
+       (so the table mirrors the email, including the action to take)."""
     import datetime
     ti = context["task_instance"]
     task_id = ti.task_id
@@ -123,7 +133,7 @@ def send_failure_email(context):
     run_type = str(context["dag_run"].run_type).split(".")[-1].lower()
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Pull the REAL failing model/test out of the task's dbt log:
+    # Find the REAL failing model/test from the task's dbt log.
     root_cause = extract_dbt_error(task_id)
 
     action_text = ("Open Airflow > " + dag_id + " > " + task_id + " > Logs for the full "
@@ -148,7 +158,7 @@ def send_failure_email(context):
         s = _snowflake_session()
         s.sql("call system$send_email(?, ?, ?, ?)",
               params=["HEALTHCARE_EMAIL_INT", ALERT_EMAIL, safe_subject, safe_body]).collect()
-        # Table row now mirrors the email: root cause in error_summary + the action line.
+        # Save the same details (real cause + action) to the error-log table.
         s.sql(
             "INSERT INTO HEALTHCARE_DB.AUDIT.PIPELINE_ERROR_LOG "
             "(dag_id, task_id, status, triggered_by, attempt, error_summary, action, failed_at) "
@@ -160,18 +170,19 @@ def send_failure_email(context):
         print("failure email/log could not be written: " + str(e))
 
 
+# Default settings applied to every task in this DAG.
 default_args = {
     "owner": "priyanka",
-    "retries": 1,
+    "retries": 1,                               # retry once before failing
     "retry_delay": timedelta(minutes=2),
-    "on_failure_callback": send_failure_email,
+    "on_failure_callback": send_failure_email,   # call the handler above on failure
 }
 
 
-# Each dbt command pipes its output through `tee` into a per-task log file that
-# the failure callback reads. `set -o pipefail` ensures the task still FAILS when
-# dbt fails (tee would otherwise mask the exit code). `2>&1` captures errors too.
 def dbt_cmd(task_id, dbt_sub):
+    """Build the shell command for a dbt task. It runs the dbt command AND tees
+       (copies) its output to a log file so the failure handler can read the real
+       error. 'set -o pipefail' makes sure the task still FAILS if dbt fails."""
     return (
         "mkdir -p " + LOG_DIR + " && set -o pipefail && "
         "cd " + PROJECT + " && "
@@ -180,32 +191,39 @@ def dbt_cmd(task_id, dbt_sub):
     )
 
 
+# Define the DAG (the workflow) and its four tasks.
 with DAG(
     dag_id="healthcare_pipeline",
-    description="Trigger-only healthcare transform pipeline (single gatekeeper path)",
+    description="Transform pipeline: builds Silver and Gold from validated Bronze data",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
-    schedule=timedelta(minutes=10),
+    schedule=timedelta(minutes=10),   # backup schedule; usually triggered by the gatekeeper
     catchup=False,
     max_active_runs=1,
     tags=["healthcare", "dbt", "snowflake"],
 ) as dag:
 
+    # TASK 1: build the Silver (STAGING) and Gold (MARTS) tables.
     dbt_run = BashOperator(
         task_id="dbt_run",
         bash_command=dbt_cmd("dbt_run", "run"),
     )
+    # TASK 2: capture the SCD2 doctor-history snapshot.
     dbt_snapshot = BashOperator(
         task_id="dbt_snapshot",
         bash_command=dbt_cmd("dbt_snapshot", "snapshot"),
     )
+    # TASK 3: run all the data-quality tests.
     dbt_test = BashOperator(
         task_id="dbt_test",
         bash_command=dbt_cmd("dbt_test", "test"),
     )
+    # TASK 4: a simple "pipeline complete" marker at the end.
     reconciliation = BashOperator(
         task_id="reconciliation",
         bash_command="cd " + PROJECT + " && echo 'Pipeline complete - see AUDIT logs'",
     )
 
+    # ORDER: run -> snapshot -> test -> reconciliation.
+    # Each task only runs if the one before it succeeded.
     dbt_run >> dbt_snapshot >> dbt_test >> reconciliation

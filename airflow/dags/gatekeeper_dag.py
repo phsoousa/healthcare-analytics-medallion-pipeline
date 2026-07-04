@@ -1,28 +1,41 @@
 """
-gatekeeper_dag - Validate-before-load DQ pipeline.
-Watches incoming/ folder, runs 12 tiered checks, loads or quarantines.
-On a SUCCESSFUL load, triggers the main healthcare_pipeline so the new
-data is transformed into Gold immediately (no waiting for the 10-min poll).
+============================================================================
+ GATEKEEPER DAG  —  the Airflow schedule that RUNS the gatekeeper
+============================================================================
+WHAT THIS FILE DOES:
+  This is an Airflow DAG (a scheduled workflow). It does two things, in order:
 
-NOTE ON THE TWO GATEKEEPER EMAILS:
-  1) QUARANTINE email  - sent by snowpark/gatekeeper.py when a FILE fails the
-     12 checks. Detailed (file, failed checks, counts). Already logs to
-     AUDIT.FILE_PROCESSING_LOG + AUDIT.DQ_METRICS_LOG.
-  2) DAG-FAILURE email - sent by THIS file's on_failure_callback when the
-     gatekeeper TASK ITSELF crashes (Snowflake unreachable, bad key, python
-     error - not a quarantine). Formatted + logged to AUDIT.PIPELINE_ERROR_LOG,
-     now including the ACTION line so the table row mirrors the email.
+     Task 1  gatekeeper_validate       -> runs snowpark/gatekeeper.py
+                                          (validate files, load good ones,
+                                           quarantine bad ones)
+     Task 2  trigger_healthcare_pipeline -> starts the transform pipeline
+                                          (so the new data becomes Gold right away)
+
+  This file does NOT do the validation itself — it just RUNS the gatekeeper
+  script and then triggers the next pipeline.
+
+TWO KINDS OF GATEKEEPER EMAILS (don't confuse them):
+  1) QUARANTINE email  - sent by gatekeeper.py when a FILE fails the 12 checks.
+                         This is normal operation (bad data was caught).
+  2) DAG-FAILURE email - sent by THIS file (below) only when the gatekeeper
+                         TASK ITSELF crashes (e.g. Snowflake unreachable, bad
+                         key, code error) - a real system problem, not a
+                         quarantine.
+============================================================================
 """
 from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
+# Paths inside the Airflow container (mapped from your project by docker-compose)
 PROJECT = "/opt/airflow/project"
-ALERT_EMAIL = "priyankapandey000111@gmail.com"
+ALERT_EMAIL = "priyankapandey000111@gmail.com"   # who receives DAG-crash alerts
 
 
 def _snowflake_session():
+    """Open a Snowflake connection (key-pair auth) so the failure handler below
+       can send an alert email and write a row to the error log."""
     import os
     from snowflake.snowpark import Session
     from cryptography.hazmat.primitives import serialization
@@ -40,6 +53,10 @@ def _snowflake_session():
 
 
 def send_failure_email(context):
+    """Runs ONLY when a task in this DAG CRASHES (Airflow calls this automatically
+       via on_failure_callback below). It emails an alert AND writes a matching row
+       to PIPELINE_ERROR_LOG. Note: a file quarantine is NOT a crash, so it does
+       not trigger this - quarantines are handled inside gatekeeper.py instead."""
     import datetime as _dt
     ti = context["task_instance"]
     task_id = ti.task_id
@@ -49,7 +66,7 @@ def send_failure_email(context):
     run_type = str(context["dag_run"].run_type).split(".")[-1].lower()
     ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Plain-English meaning per task
+    # A plain-English explanation of what each task failing means.
     stage_meaning = {
         "gatekeeper_validate":
             "The gatekeeper worker itself failed to run (e.g. Snowflake unreachable, "
@@ -82,7 +99,7 @@ def send_failure_email(context):
         # 1) send the alert email
         s.sql("call system$send_email(?, ?, ?, ?)",
               params=["HEALTHCARE_EMAIL_INT", ALERT_EMAIL, safe_subject, safe_body]).collect()
-        # 2) write the SAME details to the permanent error-log table (now incl. action)
+        # 2) write the same details to the permanent error-log table
         s.sql(
             "INSERT INTO HEALTHCARE_DB.AUDIT.PIPELINE_ERROR_LOG "
             "(dag_id, task_id, status, triggered_by, attempt, error_summary, action, failed_at) "
@@ -94,36 +111,41 @@ def send_failure_email(context):
         print(f"failure email/log could not be written: {e}")
 
 
+# Default settings applied to every task in this DAG.
 default_args = {
     "owner": "priyanka",
-    "retries": 1,
+    "retries": 1,                              # retry once before failing
     "retry_delay": timedelta(minutes=2),
-    "on_failure_callback": send_failure_email,
+    "on_failure_callback": send_failure_email,  # call the handler above on a crash
 }
 
+# Define the DAG (the workflow) and its two tasks.
 with DAG(
     dag_id="gatekeeper_pipeline",
     description="Validate-before-load gatekeeper for incoming files",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
-    schedule=timedelta(minutes=10),
+    schedule=timedelta(minutes=10),   # also runs automatically every 10 minutes
     catchup=False,
     max_active_runs=1,
     tags=["healthcare", "data-quality", "gatekeeper"],
 ) as dag:
 
+    # TASK 1: run the gatekeeper script (validate + load + quarantine).
     gatekeeper = BashOperator(
         task_id="gatekeeper_validate",
         bash_command=f"cd {PROJECT} && python snowpark/gatekeeper.py",
     )
 
-    # After a successful validate+load, trigger the main pipeline to
-    # transform the new data into Gold immediately.
+    # TASK 2: once the gatekeeper succeeds, start the transform pipeline so the
+    # newly-loaded data is turned into Gold immediately (no waiting for its schedule).
     trigger_dbt = TriggerDagRunOperator(
         task_id="trigger_healthcare_pipeline",
-        trigger_dag_id="healthcare_pipeline",
-        wait_for_completion=False,   # fire-and-forget; main DAG runs independently
+        trigger_dag_id="healthcare_pipeline",   # <-- the DAG this one triggers
+        wait_for_completion=False,              # fire-and-forget; it runs on its own
         reset_dag_run=True,
     )
 
+    # ORDER: run the gatekeeper first, THEN trigger the pipeline.
+    # (If Task 1 crashes, Task 2 is skipped and the pipeline is not triggered.)
     gatekeeper >> trigger_dbt

@@ -3,7 +3,7 @@
 -- Why this layer exists: dedup, cross-row window logic, real readmission
 -- detection, and row-level data-quality gating.
 --
--- SINGLE INGESTION PATH: Snowpipe is retired. The gatekeeper validates
+--The gatekeeper validates
 -- every file and loads it into RAW.PATIENT_ADMISSIONS, so this model now
 -- reads ONE source table (no more Snowpipe + GK_ union).
 --
@@ -24,6 +24,7 @@
         on_schema_change='sync_all_columns'
     )
 }}
+
 
 -- Patients touched since the last run (only used on incremental runs).
 {% if is_incremental() %}

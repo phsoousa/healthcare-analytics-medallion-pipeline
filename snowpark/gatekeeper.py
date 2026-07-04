@@ -1,14 +1,19 @@
 """
-GATEKEEPER — Validate-BEFORE-Load Data Quality Pipeline (multi-feed, single path)
-Handles patient_admissions, treatment_records, and insurance_claims.
+============================================================================
+ GATEKEEPER  —  the data-quality "front door" for the pipeline
+============================================================================
+WHAT THIS FILE DOES:
+  Every data file (patient_admissions, treatment_records, insurance_claims)
+  is uploaded to an S3 "incoming" folder. This script checks each file
+  BEFORE it is allowed into the database:
 
-This is the ONLY ingestion path. Snowpipe is retired. Every file — in any
-batch (morning / afternoon / evening) — is uploaded to the incoming/ folder.
+     read the file's columns  ->  run 12 quality checks
+        PASS  ->  load the data into the RAW table  ->  archive the file to "processed"
+        FAIL  ->  move the file to "quarantine"  +  send an alert email  +  log it
 
-Per file:
-  read the ACTUAL header  ->  run 12 tiered checks
-    PASS  -> COPY INTO the real RAW table  ->  move file to processed/
-    FAIL  -> move file to quarantine/  +  email  +  log, never loads
+  So good data gets in, bad data is stopped at the door. This is the ONLY
+  path data takes into the warehouse.
+============================================================================
 """
 import os
 import uuid
@@ -19,23 +24,31 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 
-# ── Shared settings (same for every feed) ──
+# ---------------------------------------------------------------------------
+# COMMON SETTINGS — shared by every data feed
+# These point at the S3 stages (folders), the CSV formats, and the thresholds
+# used by the quality checks.
+# ---------------------------------------------------------------------------
 COMMON = {
-    "incoming_stage":    "HEALTHCARE_DB.RAW.GK_INCOMING",
-    "processed_stage":   "HEALTHCARE_DB.RAW.GK_PROCESSED",
-    "quarantine_stage":  "HEALTHCARE_DB.RAW.GK_QUARANTINE",
-    "file_format":       "HEALTHCARE_DB.RAW.HEALTHCARE_CSV",
-    "file_format_nohdr": "HEALTHCARE_DB.RAW.HEALTHCARE_CSV_NOHEADER",
-    "email_integration": "HEALTHCARE_EMAIL_INT",
-    "min_rows":          1,
-    "max_null_pct":      5.0,
-    "date_min":          "2020-01-01",
+    "incoming_stage":    "HEALTHCARE_DB.RAW.GK_INCOMING",    # where new files arrive
+    "processed_stage":   "HEALTHCARE_DB.RAW.GK_PROCESSED",   # archive for good files
+    "quarantine_stage":  "HEALTHCARE_DB.RAW.GK_QUARANTINE",  # holding pen for bad files
+    "file_format":       "HEALTHCARE_DB.RAW.HEALTHCARE_CSV",           # skips header, loads data
+    "file_format_nohdr": "HEALTHCARE_DB.RAW.HEALTHCARE_CSV_NOHEADER",  # reads header AS data
+    "email_integration": "HEALTHCARE_EMAIL_INT",             # used to send alert emails
+    "min_rows":          1,           # a file must have at least this many rows
+    "max_null_pct":      5.0,         # a required column may be at most 5% empty
+    "date_min":          "2020-01-01",  # dates must fall in this range
     "date_max":          "2030-12-31",
 }
 
-# ── Per-feed configs. The "file_pattern" decides which config a file uses. ──
-# target_table now points at the REAL RAW tables (no more GK_ prefix), so the
-# gatekeeper is the single validated front door to Bronze and dbt reads it directly.
+# ---------------------------------------------------------------------------
+# PER-FEED SETTINGS
+# Each of the 3 data types has its own rules: which table to load, which
+# columns are expected/required, the primary key, which columns must be
+# numeric, the date column, and the valid category values.
+# "file_pattern" is how we recognise which feed a file belongs to (by its name).
+# ---------------------------------------------------------------------------
 CONFIGS = {
     "patient_admissions": {
         "file_pattern":     "patient_admissions",
@@ -44,15 +57,15 @@ CONFIGS = {
                              "admit_date", "department", "admission_type",
                              "diagnosis_code", "length_of_stay", "readmission_flag"],
         "required_columns": ["admission_id", "patient_id", "doctor_id", "hospital_id"],
-        "pk_column":        "admission_id",
+        "pk_column":        "admission_id",   # this column must be unique
         "numeric_columns":  ["admission_id", "length_of_stay"],
         "date_column":      "admit_date",
         "category_column":  "admission_type",
-        "valid_categories": ["EMG", "URG", "ELC"],
+        "valid_categories": ["EMG", "URG", "ELC"],   # only these values are allowed
         "load_columns":     "admission_id, patient_id, doctor_id, hospital_id, admit_date, "
                             "department, admission_type, diagnosis_code, length_of_stay, "
                             "readmission_flag, file_name, upload_dttm, load_dttm",
-        "load_select":      "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10",
+        "load_select":      "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10",   # file columns 1..10
     },
     "treatment_records": {
         "file_pattern":     "treatment_records",
@@ -90,6 +103,7 @@ CONFIGS = {
 
 @dataclass
 class DQResult:
+    """One result from a single quality check: its name, tier, pass/fail, and detail."""
     check_name: str
     tier: str
     passed: bool
@@ -97,6 +111,9 @@ class DQResult:
 
 
 def get_session():
+    """Open a secure connection to Snowflake using key-pair authentication.
+       Reads the private key file and the account/user from environment variables
+       (set by docker-compose) — no passwords are hard-coded."""
     key = open(os.environ["SNOWFLAKE_PRIVATE_KEY_PATH"], "rb").read()
     pk = serialization.load_pem_private_key(key, password=None, backend=default_backend())
     pkb = pk.private_bytes(
@@ -116,7 +133,8 @@ def get_session():
 
 
 def detect_config(file_name):
-    """Pick the right config based on which pattern appears in the filename."""
+    """Look at the file name and return the matching feed settings.
+       e.g. a file called 'patient_admissions.csv' returns the admissions config."""
     for cfg in CONFIGS.values():
         if cfg["file_pattern"] in file_name.lower():
             return cfg
@@ -124,6 +142,7 @@ def detect_config(file_name):
 
 
 def list_incoming(session):
+    """List every recognised .csv file currently sitting in the incoming folder."""
     rows = session.sql(f"LIST @{COMMON['incoming_stage']}").collect()
     files = []
     for r in rows:
@@ -134,6 +153,9 @@ def list_incoming(session):
 
 
 def read_header(session, file_name, cfg):
+    """Peek at the FIRST row of the file (the header) to learn its column names.
+       Uses the NO-HEADER format so the header line is read as plain data.
+       Returns a clean, lower-cased list of column names."""
     selects = ",".join([f"${i}" for i in range(1, len(cfg["expected_columns"]) + 2)])
     rows = session.sql(f"""
         SELECT {selects}
@@ -148,6 +170,9 @@ def read_header(session, file_name, cfg):
 
 
 def load_to_temp(session, file_name, n_cols):
+    """Load the whole file into a TEMPORARY table (all text columns) just so the
+       quality checks can inspect it. Nothing official yet — this is a scratch copy.
+       ON_ERROR = CONTINUE means even messy rows load, so the checks can see them."""
     cols_ddl = ", ".join([f"C{i} VARCHAR" for i in range(n_cols)])
     session.sql(f"CREATE OR REPLACE TEMP TABLE GK_TEMP_RAW ({cols_ddl})").collect()
     session.sql(f"""
@@ -159,35 +184,43 @@ def load_to_temp(session, file_name, n_cols):
 
 
 def col_ref(header, name):
+    """Find which temp-table column (C0, C1, C2 ...) holds a given named column."""
     name = name.lower()
     return f"C{header.index(name)}" if name in header else None
 
 
 def run_checks(session, file_name, header, cfg):
+    """Run the 12 quality checks on the temp copy of the file, grouped in 3 tiers:
+         GATE (3)      - must pass or the file is rejected immediately
+         THRESHOLD (5) - data-quality limits (nulls, types, duplicates, categories)
+         ADVISORY (2)  - warnings only, do not block the load
+       Returns a list of DQResult objects (one per check)."""
     results = []
     R = results.append
 
-    # ---- GATE (3) ----
+    # ---- GATE tier: structural checks. If any fail, stop here. ----
     size_rows = session.sql(f"LIST @{COMMON['incoming_stage']}/{file_name}").collect()
     size = size_rows[0]["size"] if size_rows else 0
-    R(DQResult("file_not_empty", "GATE", size > 0, f"size={size} bytes"))
+    R(DQResult("file_not_empty", "GATE", size > 0, f"size={size} bytes"))   # 1. file has content
 
-    R(DQResult("column_count", "GATE",
+    R(DQResult("column_count", "GATE",                                      # 2. right number of columns
                len(header) == len(cfg["expected_columns"]),
                f"found {len(header)}, expected {len(cfg['expected_columns'])}"))
 
     missing = [c for c in cfg["required_columns"] if c.lower() not in header]
-    R(DQResult("required_columns", "GATE", len(missing) == 0,
+    R(DQResult("required_columns", "GATE", len(missing) == 0,               # 3. required columns present
                f"missing={missing}" if missing else "all present"))
 
+    # If any GATE check failed, the file is unusable — return now (quarantine it).
     if any(r.tier == "GATE" and not r.passed for r in results):
         return results
 
     total = session.sql("SELECT COUNT(*) c FROM GK_TEMP_RAW").collect()[0]["C"]
 
-    # ---- THRESHOLD (5) ----
-    R(DQResult("row_count", "THRESHOLD", total >= COMMON["min_rows"], f"rows={total}"))
+    # ---- THRESHOLD tier: data-quality limits. ----
+    R(DQResult("row_count", "THRESHOLD", total >= COMMON["min_rows"], f"rows={total}"))  # 4. has rows
 
+    # 5. required columns must not be too empty (<= 5% null)
     null_details, null_ok = [], True
     for c in cfg["required_columns"]:
         ref = col_ref(header, c)
@@ -198,17 +231,20 @@ def run_checks(session, file_name, header, cfg):
             null_ok = False
     R(DQResult("null_percentage", "THRESHOLD", null_ok, ", ".join(null_details)))
 
+    # 6. numeric columns must actually contain numbers
     num_checks = " OR ".join(
         [f"TRY_CAST({col_ref(header, c)} AS NUMBER) IS NULL" for c in cfg["numeric_columns"]])
     bad_num = session.sql(f"SELECT COUNT(*) c FROM GK_TEMP_RAW WHERE {num_checks}").collect()[0]["C"]
     R(DQResult("data_types", "THRESHOLD", bad_num == 0, f"non-numeric rows={bad_num}"))
 
+    # 7. the primary key must be unique (no duplicate IDs)
     pk = col_ref(header, cfg["pk_column"])
     dupe_pk = session.sql(
         f"SELECT COUNT(*) c FROM (SELECT {pk} FROM GK_TEMP_RAW "
         f"GROUP BY {pk} HAVING COUNT(*) > 1)").collect()[0]["C"]
     R(DQResult("pk_uniqueness", "THRESHOLD", dupe_pk == 0, f"duplicate ids={dupe_pk}"))
 
+    # 8. the category column must only contain allowed values
     cat = col_ref(header, cfg["category_column"])
     bad_cat = session.sql(
         f"SELECT COUNT(*) c FROM GK_TEMP_RAW WHERE {cat} NOT IN ("
@@ -216,13 +252,15 @@ def run_checks(session, file_name, header, cfg):
     R(DQResult(f"valid_{cfg['category_column']}", "THRESHOLD", bad_cat == 0,
                f"invalid values={bad_cat}"))
 
-    # ---- ADVISORY (2 generic) ----
+    # ---- ADVISORY tier: warnings only (do NOT block the load). ----
+    # 11. fully duplicate rows
     all_refs = ",".join([f"C{i}" for i in range(len(header))])
     dupe_rows = session.sql(
         "SELECT COUNT(*) c FROM (SELECT *, COUNT(*) OVER "
         f"(PARTITION BY {all_refs}) n FROM GK_TEMP_RAW) WHERE n > 1").collect()[0]["C"]
     R(DQResult("duplicate_rows", "ADVISORY", dupe_rows == 0, f"dup rows={dupe_rows}"))
 
+    # 12. dates fall within the allowed range
     dref = col_ref(header, cfg["date_column"])
     bad_date = session.sql(
         f"SELECT COUNT(*) c FROM GK_TEMP_RAW WHERE TRY_TO_DATE({dref}) "
@@ -233,9 +271,13 @@ def run_checks(session, file_name, header, cfg):
 
 
 def load_file(session, file_name, cfg):
-    """COPY the validated file into the REAL RAW table, filling the 3 metadata columns.
-       Returns the number of rows this COPY added (not the whole-table count), so
-       batch loads with repeated filenames report the correct per-batch row count."""
+    """The file PASSED — load its rows into the REAL RAW table.
+       As it loads, it stamps 3 tracking columns on every row:
+         file_name    - which file the row came from
+         upload_dttm  - when the file arrived in S3
+         load_dttm    - when Snowflake loaded it (now, in UTC)
+       Reads FROM the incoming folder (never from processed).
+       Returns how many rows THIS file added."""
     before = session.sql(
         f"SELECT COUNT(*) c FROM {cfg['target_table']}").collect()[0]["C"]
     session.sql(f"""
@@ -257,12 +299,10 @@ def load_file(session, file_name, cfg):
 
 
 def move_file(session, file_name, dest_stage):
-    """Move the file out of incoming/ into a per-run TIMESTAMPED SUBFOLDER of the
-    destination (processed/ or quarantine/). The timestamp subfolder means a client
-    can upload the SAME filename every batch (morning/afternoon/evening) and nothing
-    is ever overwritten — each batch keeps its own copy at
-        processed/20260629_130245/patient_admissions.csv
-    so the S3 trail matches the AUDIT.FILE_PROCESSING_LOG record."""
+    """Move the file out of the incoming folder into a timestamped subfolder of the
+       destination (processed/ for good files, quarantine/ for bad ones).
+       The timestamp means the same filename can be uploaded again tomorrow
+       without overwriting today's copy. Copies first, then removes the original."""
     stamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     session.sql(f"COPY FILES INTO @{dest_stage}/{stamp}/ "
                 f"FROM @{COMMON['incoming_stage']}/{file_name}").collect()
@@ -270,6 +310,8 @@ def move_file(session, file_name, dest_stage):
 
 
 def get_recipients(session):
+    """Read the list of people who should receive quarantine alerts from the
+       EMAIL_RECIPIENT_LOG table (only active recipients for DQ_FAILURE alerts)."""
     rows = session.sql(
         "SELECT recipient_email FROM HEALTHCARE_DB.AUDIT.EMAIL_RECIPIENT_LOG "
         "WHERE alert_type='DQ_FAILURE' AND is_active=TRUE").collect()
@@ -277,6 +319,7 @@ def get_recipients(session):
 
 
 def send_email(session, recipients, subject, body):
+    """Send an alert email to each recipient using Snowflake's email integration."""
     safe_subject = subject.replace("'", "")
     safe_body = body.replace("'", "")
     for to in recipients:
@@ -286,8 +329,9 @@ def send_email(session, recipients, subject, body):
 
 def log_file(session, run_id, file_name, status, rows, passed, failed,
              feed="", failed_checks="", action=""):
-    # Column list is explicit so the row mirrors the email: adds feed_type,
-    # failed_checks (same text as the quarantine email) and action.
+    """Write one summary row per file to FILE_PROCESSING_LOG (the 'report card').
+       Records the status (PASSED/QUARANTINED), row counts, the feed, the list of
+       failed checks, and the recommended action — so the table mirrors the email."""
     session.sql(
         "INSERT INTO HEALTHCARE_DB.AUDIT.FILE_PROCESSING_LOG "
         "(run_id, file_name, status, rows_loaded, checks_passed, checks_failed, "
@@ -298,6 +342,8 @@ def log_file(session, run_id, file_name, status, rows, passed, failed,
 
 
 def log_checks(session, run_id, file_name, results):
+    """Write one row per individual check to DQ_METRICS_LOG (the 'answer sheet').
+       This is the detailed evidence behind the report card above."""
     for r in results:
         session.sql(
             "INSERT INTO HEALTHCARE_DB.AUDIT.DQ_METRICS_LOG "
@@ -307,8 +353,15 @@ def log_checks(session, run_id, file_name, results):
 
 
 def main():
+    """The orchestrator — runs the whole gatekeeper, file by file:
+         1. connect to Snowflake
+         2. list the files waiting in the incoming folder
+         3. for each file: read header -> load to temp -> run 12 checks -> log checks
+         4. decide: PASS -> load + archive + log;  FAIL -> quarantine + email + log
+         5. if any file was quarantined, raise an error at the end so Airflow
+            marks the run for attention."""
     session = get_session()
-    run_id = str(uuid.uuid4())[:8]
+    run_id = str(uuid.uuid4())[:8]     # short id linking all logs from this run
     print(f"[{run_id}] Gatekeeper starting")
 
     files = list_incoming(session)
@@ -323,24 +376,27 @@ def main():
         feed = cfg["file_pattern"]
         print(f"[{run_id}] Processing {file_name}  (feed: {feed})")
 
+        # --- inspect the file ---
         header = read_header(session, file_name, cfg)
         load_to_temp(session, file_name, max(len(header), 1))
         results = run_checks(session, file_name, header, cfg)
-        log_checks(session, run_id, file_name, results)
+        log_checks(session, run_id, file_name, results)   # save every check result
 
+        # --- tally the results ---
         gate_fail = [r for r in results if r.tier == "GATE" and not r.passed]
         thresh_fail = [r for r in results if r.tier == "THRESHOLD" and not r.passed]
         passed_n = sum(1 for r in results if r.passed)
         failed_n = sum(1 for r in results if not r.passed)
 
+        # --- decide: quarantine or load ---
         if gate_fail or thresh_fail:
+            # BAD FILE: move to quarantine, log it, and email an alert. NOT loaded.
             any_quarantined = True
             move_file(session, file_name, COMMON["quarantine_stage"])
             failed_block = "\n".join([f"    - {r.check_name} [{r.tier}]: {r.detail}"
                                       for r in (gate_fail + thresh_fail)])
             quarantine_action = ("File moved to quarantine/ folder. "
                                  "Review and re-upload a corrected file.")
-            # Log row now mirrors the email: feed, the failed-checks text, and action.
             log_file(session, run_id, file_name, "QUARANTINED", 0, passed_n, failed_n,
                      feed=feed, failed_checks=failed_block, action=quarantine_action)
             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -359,6 +415,7 @@ def main():
                        f"GATEKEEPER QUARANTINE - {file_name}", email_body)
             print(f"[{run_id}] QUARANTINED {file_name}")
         else:
+            # GOOD FILE: load the rows into RAW, then archive the file to processed.
             rows = load_file(session, file_name, cfg)
             move_file(session, file_name, COMMON["processed_stage"])
             log_file(session, run_id, file_name, "PASSED", rows, passed_n, failed_n,
@@ -370,6 +427,8 @@ def main():
             print(f"[{run_id}] PASSED {file_name}: loaded {rows} rows{warn}")
 
     session.close()
+
+    # If anything was quarantined, raise an error so the Airflow run is flagged.
     if any_quarantined:
         raise RuntimeError(f"[{run_id}] Gatekeeper: one or more files quarantined.")
     print(f"[{run_id}] Gatekeeper complete — all files passed")
