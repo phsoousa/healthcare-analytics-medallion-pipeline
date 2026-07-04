@@ -1,0 +1,6 @@
+﻿admission_id,doctor_id,hospital_id,admit_date,department,admission_type,diagnosis_code,length_of_stay,readmission_flag
+102001,D045,H03,15/01/2024,CARD,EMG,I21,5,0
+102002,D102,H01,20/02/2024,ORTH,ELC,M17,3,0
+102003,D078,H05,10/03/2024,NEPH,URG,N18,7,1
+102004,D156,H02,05/04/2024,PULM,EMG,J44,4,0
+102005,D023,H08,12/05/2024,CARD,ELC,I50,6,0
