@@ -1,5 +1,7 @@
 # Healthcare Analytics — End-to-End Medallion Data Pipeline
 
+![Project overview](docs/screenshots/image.png)
+
 An end-to-end data engineering pipeline built to practice the full modern data stack: ingesting raw healthcare files, validating their quality before they ever touch a table, transforming them through a Bronze → Silver → Gold (medallion) architecture, orchestrating the whole thing on a schedule, and surfacing the results in a BI dashboard.
 
 Built as a hands-on portfolio project, from account setup to a production-style, fully tested, orchestrated pipeline.
