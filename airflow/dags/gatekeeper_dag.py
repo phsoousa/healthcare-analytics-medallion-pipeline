@@ -30,7 +30,7 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # Paths inside the Airflow container (mapped from your project by docker-compose)
 PROJECT = "/opt/airflow/project"
-ALERT_EMAIL = "priyankapandey000111@gmail.com"   # who receives DAG-crash alerts
+ALERT_EMAIL = "ph.sousa92@gmail.com"   # who receives DAG-crash alerts
 
 
 def _snowflake_session():

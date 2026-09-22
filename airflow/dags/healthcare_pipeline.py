@@ -29,7 +29,7 @@ from airflow.operators.bash import BashOperator
 # Paths inside the Airflow container (mapped from your project by docker-compose)
 PROJECT = "/opt/airflow/project"
 PROFILES_DIR = "/opt/airflow/config"     # where dbt finds profiles.yml
-ALERT_EMAIL = "priyankapandey000111@gmail.com"
+ALERT_EMAIL = "ph.sousa92@gmail.com"
 
 # Each dbt task writes its console output here so the failure handler can read it.
 LOG_DIR = "/tmp/dbt_task_logs"

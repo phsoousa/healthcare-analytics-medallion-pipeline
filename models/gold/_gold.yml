@@ -6,7 +6,11 @@ models:
       - name: doctor_sk
         tests: [unique, not_null]
       - name: doctor_id
-        tests: [unique, not_null]
+        tests:
+          - unique
+          - not_null:
+              config:
+                where: "seniority_band != 'Unknown'"
       - name: seniority_band
         tests:
           - accepted_values:

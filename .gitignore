@@ -30,3 +30,7 @@ airflow/config/
 # Big source + test data (goes to S3, not git)
 *.csv
 !seeds/*.csv
+# Added: local venv + OS files
+venv/
+.DS_Store
+Thumbs.db
