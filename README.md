@@ -101,14 +101,14 @@ The most important design decision in this pipeline: **nothing reaches the wareh
 
 ## Dashboards
 
-Interactive Power BI dashboard built on top of the Gold layer, including:
+Interactive Power BI dashboard built on top of the Gold layer:
 
 - KPI overview (total admissions, average length of stay)
 - Admissions by hospital
 - Admissions trend by month
 - *(Claims analysis page — in progress)*
 
-![Power BI dashboard](docs/screenshots/powerbi-overview.png)
+_Dashboard screenshot coming soon — formatting pass in progress._
 
 _More screenshots: see [`docs/screenshots/`](docs/screenshots/)._
 
