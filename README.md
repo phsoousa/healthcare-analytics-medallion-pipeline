@@ -75,6 +75,12 @@ The most important design decision in this pipeline: **nothing reaches the wareh
 - Every decision (pass, quarantine, and *why*) is written to a Snowflake audit table — full traceability of what was loaded, what wasn't, and the exact reason.
 - Validated end-to-end with both "happy path" files and intentionally corrupted (`_bad`) versions of each source file, confirming the gatekeeper correctly quarantines each one for the expected reason.
 
+![Gatekeeper audit log — passed vs. quarantined](docs/screenshots/snowflake-audit-log.png)
+*`patient_admissions.csv` passes all 10 checks and loads 50,000 rows; the five corrupted `_bad` files are each quarantined for a specific, logged reason.*
+
+![Gatekeeper detailed check log](docs/screenshots/snowflake-dq-metrics.png)
+*Every individual check (GATE / THRESHOLD / ADVISORY) recorded per file, with pass/fail detail — full auditability down to the check level.*
+
 ## Testing
 
 - **41 automated dbt tests** across staging and marts models (`not_null`, `unique`, `relationships`, `accepted_values`), all passing — covering referential integrity between facts and dimensions, valid categorical values, and primary-key uniqueness across the whole Gold layer.
@@ -85,6 +91,14 @@ The most important design decision in this pipeline: **nothing reaches the wareh
 - Snowflake authentication handled via RSA key-pair (no passwords in code or config).
 - Automated email alerting on pipeline failures.
 
+## Pipeline in action
+
+![Airflow — task-level execution](docs/screenshots/airflow-task-instances.png)
+*Every stage of the pipeline (`dbt_run`, `dbt_snapshot`, `dbt_test`, `reconciliation`, plus the gatekeeper's own validation and trigger tasks) completing successfully, run after run.*
+
+![Airflow — DAG run history](docs/screenshots/airflow-runs.png)
+*The pipeline running reliably end-to-end on a schedule, both scheduled and manually triggered runs, all green.*
+
 ## Dashboards
 
 Interactive Power BI dashboard built on top of the Gold layer, including:
@@ -94,7 +108,9 @@ Interactive Power BI dashboard built on top of the Gold layer, including:
 - Admissions trend by month
 - *(Claims analysis page — in progress)*
 
-_Screenshots: see [`docs/screenshots/`](docs/screenshots/)._
+![Power BI dashboard](docs/screenshots/powerbi-overview.png)
+
+_More screenshots: see [`docs/screenshots/`](docs/screenshots/)._
 
 ## Challenges solved along the way
 
